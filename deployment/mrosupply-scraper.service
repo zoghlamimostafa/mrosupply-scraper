@@ -1,0 +1,49 @@
+[Unit]
+Description=MRO Supply Autonomous Web Scraper
+Documentation=https://github.com/your-repo/mrosupply-scraper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scraper
+Group=scraper
+WorkingDirectory=/opt/mrosupply-scraper
+
+# Environment
+Environment="PATH=/opt/mrosupply-scraper/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+# Main process
+ExecStart=/opt/mrosupply-scraper/venv/bin/python3 /opt/mrosupply-scraper/watchdog.py
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=3
+
+# Resource limits
+LimitNOFILE=65536
+MemoryLimit=4G
+CPUQuota=400%
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mrosupply-scraper
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mrosupply-scraper
+
+# Graceful shutdown
+TimeoutStopSec=300
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

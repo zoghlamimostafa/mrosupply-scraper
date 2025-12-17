@@ -1,0 +1,252 @@
+name: Distributed Web Scraping
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: 'URLs per batch'
+        required: false
+        default: '500'
+      total_batches:
+        description: 'Number of batches to process (0 = all)'
+        required: false
+        default: '0'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      total_batches: ${{ steps.set-matrix.outputs.total_batches }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4 lxml
+
+      - name: Create batch files
+        id: set-matrix
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+
+          # Configuration
+          batch_size = int("${{ github.event.inputs.batch_size }}")
+          total_urls = 1500000  # Total products
+          total_batches = (total_urls + batch_size - 1) // batch_size
+
+          # Limit for testing or use all
+          max_batches = int("${{ github.event.inputs.total_batches }}")
+          if max_batches > 0:
+              total_batches = min(total_batches, max_batches)
+
+          # GitHub Actions allows max 256 jobs in matrix
+          # We'll create batch groups
+          max_concurrent = 256
+
+          if total_batches <= max_concurrent:
+              # Can run all batches in one go
+              matrix = list(range(total_batches))
+          else:
+              # Need multiple workflow runs
+              # For now, run first 256
+              matrix = list(range(min(total_batches, max_concurrent)))
+              print(f"Note: Running {max_concurrent} batches. Total: {total_batches}")
+
+          # Output for matrix
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"matrix={json.dumps(matrix)}\n")
+              f.write(f"total_batches={total_batches}\n")
+
+          print(f"Created {len(matrix)} batch jobs")
+          EOF
+
+  scrape:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max per job
+    strategy:
+      matrix:
+        batch_id: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false  # Continue even if some jobs fail
+      max-parallel: 256  # Maximum concurrent jobs
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Configure environment
+        env:
+          PROXY_HOST: ${{ secrets.PROXY_HOST }}
+          PROXY_PORT: ${{ secrets.PROXY_PORT }}
+          PROXY_USER: ${{ secrets.PROXY_USER }}
+          PROXY_PASS: ${{ secrets.PROXY_PASS }}
+        run: |
+          # Create .env file
+          cat > .env << EOF
+          PROXY_HOST=${PROXY_HOST}
+          PROXY_PORT=${PROXY_PORT}
+          PROXY_USER=${PROXY_USER}
+          PROXY_PASS=${PROXY_PASS}
+
+          # Batch configuration
+          BATCH_ID=${{ matrix.batch_id }}
+          BATCH_SIZE=${{ github.event.inputs.batch_size }}
+
+          # Performance tuning
+          WORKERS=5
+          DELAY=0.3
+          REQUEST_TIMEOUT=30
+          EOF
+
+      - name: Scrape batch
+        id: scrape
+        run: |
+          python3 serverless/batch_scraper.py \
+            --batch-id ${{ matrix.batch_id }} \
+            --batch-size ${{ github.event.inputs.batch_size }} \
+            --output-dir ./output
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: batch-${{ matrix.batch_id }}-results
+          path: |
+            output/batch_${{ matrix.batch_id }}_*.json
+            output/batch_${{ matrix.batch_id }}_*.csv
+          retention-days: 7
+
+      - name: Upload errors
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: batch-${{ matrix.batch_id }}-errors
+          path: |
+            output/batch_${{ matrix.batch_id }}_errors.json
+            output/batch_${{ matrix.batch_id }}.log
+          retention-days: 14
+
+  aggregate:
+    needs: [prepare, scrape]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ./artifacts
+
+      - name: Aggregate results
+        run: |
+          python3 serverless/aggregate_results.py \
+            --input-dir ./artifacts \
+            --output-file final_results.csv
+
+      - name: Generate report
+        run: |
+          python3 serverless/generate_report.py \
+            --results final_results.csv \
+            --output report.md
+
+      - name: Upload final results
+        uses: actions/upload-artifact@v3
+        with:
+          name: final-results
+          path: |
+            final_results.csv
+            final_results.json
+            report.md
+          retention-days: 30
+
+      - name: Comment on workflow
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('report.md', 'utf8');
+
+            github.rest.actions.createWorkflowDispatchComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: context.workflow,
+              comment: report
+            });
+
+  notify:
+    needs: [prepare, scrape, aggregate]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Send notification
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          NOTIFICATION_EMAIL: ${{ secrets.NOTIFICATION_EMAIL }}
+        run: |
+          python3 << 'EOF'
+          import smtplib
+          import os
+          from email.mime.text import MIMEText
+
+          # Check if scrape job succeeded
+          status = "${{ needs.scrape.result }}"
+          aggregate_status = "${{ needs.aggregate.result }}"
+
+          subject = f"🤖 Scraping Workflow {'✅ Completed' if status == 'success' else '⚠️ ' + status.title()}"
+
+          body = f"""
+          GitHub Actions Scraping Workflow Report
+
+          Status: {status.upper()}
+          Aggregation: {aggregate_status.upper()}
+
+          Total Batches: ${{ needs.prepare.outputs.total_batches }}
+          Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Check artifacts for detailed results.
+          """
+
+          # Send email
+          msg = MIMEText(body)
+          msg['Subject'] = subject
+          msg['From'] = os.environ['SMTP_USER']
+          msg['To'] = os.environ['NOTIFICATION_EMAIL']
+
+          try:
+              with smtplib.SMTP(os.environ['SMTP_HOST'], 587) as server:
+                  server.starttls()
+                  server.login(os.environ['SMTP_USER'], os.environ['SMTP_PASS'])
+                  server.send_message(msg)
+              print("✅ Notification sent")
+          except Exception as e:
+              print(f"⚠️ Failed to send notification: {e}")
+          EOF

@@ -1,0 +1,50 @@
+# Cron Jobs for MRO Supply Scraper
+# Install for scraper user: sudo crontab -u scraper -e
+# Then paste these lines
+
+# Set environment
+SHELL=/bin/bash
+PATH=/opt/mrosupply-scraper/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PYTHONPATH=/opt/mrosupply-scraper
+
+# Disk space check every 5 minutes
+*/5 * * * * cd /opt/mrosupply-scraper && python3 disk_monitor.py --check >> /opt/mrosupply-scraper/logs/disk_monitor.log 2>&1
+
+# Automatic cleanup if disk space low (every 10 minutes)
+*/10 * * * * cd /opt/mrosupply-scraper && python3 disk_monitor.py --monitor >> /opt/mrosupply-scraper/logs/disk_monitor.log 2>&1
+
+# Health check every 5 minutes
+*/5 * * * * cd /opt/mrosupply-scraper && python3 health_check.py >> /opt/mrosupply-scraper/logs/health_check.log 2>&1
+
+# Daily analytics report at 9am
+0 9 * * * cd /opt/mrosupply-scraper && python3 analytics.py --daily-report >> /opt/mrosupply-scraper/logs/analytics.log 2>&1
+
+# Backup checkpoint file every 6 hours
+0 */6 * * * cp /opt/mrosupply-scraper/data/checkpoint_products.json /opt/mrosupply-scraper/backups/checkpoint_$(date +\%Y\%m\%d_\%H\%M).json 2>> /opt/mrosupply-scraper/logs/backup.log
+
+# Daily checkpoint backup at 4am
+0 4 * * * cp /opt/mrosupply-scraper/data/checkpoint_products.json /opt/mrosupply-scraper/backups/checkpoint_daily_$(date +\%Y\%m\%d).json 2>> /opt/mrosupply-scraper/logs/backup.log
+
+# Cleanup old checkpoint backups (keep 7 days)
+0 5 * * * find /opt/mrosupply-scraper/backups/ -name "checkpoint_*.json" -mtime +7 -delete 2>> /opt/mrosupply-scraper/logs/cleanup.log
+
+# Cleanup old log backups (keep 30 days)
+0 6 * * * find /opt/mrosupply-scraper/logs/ -name "*.log.*.gz" -mtime +30 -delete 2>> /opt/mrosupply-scraper/logs/cleanup.log
+
+# Weekly full system report (Sunday at 10am)
+0 10 * * 0 cd /opt/mrosupply-scraper && python3 -c "from analytics import PerformanceAnalytics; a = PerformanceAnalytics(); a.export_report('/opt/mrosupply-scraper/reports/weekly_report_$(date +\%Y\%m\%d).json')" >> /opt/mrosupply-scraper/logs/reports.log 2>&1
+
+# Cleanup old reports (keep 60 days)
+0 7 * * * find /opt/mrosupply-scraper/reports/ -name "*.json" -mtime +60 -delete 2>> /opt/mrosupply-scraper/logs/cleanup.log
+
+# Verify scraper service is running (every hour)
+0 * * * * systemctl is-active --quiet mrosupply-scraper || { echo "$(date): Scraper service is down!" >> /opt/mrosupply-scraper/logs/service_monitor.log; systemctl start mrosupply-scraper; }
+
+# Monitor checkpoint file age (every 15 minutes)
+# Alert if checkpoint hasn't been updated in 30 minutes
+*/15 * * * * /opt/mrosupply-scraper/deployment/check_checkpoint_age.sh >> /opt/mrosupply-scraper/logs/checkpoint_monitor.log 2>&1
+
+# System resource monitoring (every 5 minutes)
+*/5 * * * * cd /opt/mrosupply-scraper && python3 -c "import psutil, json; print(json.dumps({'cpu': psutil.cpu_percent(), 'memory': psutil.virtual_memory().percent, 'disk': psutil.disk_usage('/opt/mrosupply-scraper').percent}))" >> /opt/mrosupply-scraper/logs/system_metrics.log 2>&1
+
+# Note: Some tasks require helper scripts (see deployment/scripts/ directory)

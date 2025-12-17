@@ -1,0 +1,459 @@
+name: Distributed Scraping - GitHub Actions + Azure Functions
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_products:
+        description: 'Total products to scrape'
+        required: false
+        default: '1500000'
+      batch_size:
+        description: 'Products per batch'
+        required: false
+        default: '100'
+      use_azure_functions:
+        description: 'Use Azure Functions (true/false)'
+        required: false
+        default: 'true'
+      github_workers:
+        description: 'GitHub Actions workers'
+        required: false
+        default: '50'
+
+env:
+  AZURE_FUNCTION_URL: ${{ secrets.AZURE_FUNCTION_URL }}
+  AZURE_FUNCTION_KEY: ${{ secrets.AZURE_FUNCTION_KEY }}
+
+jobs:
+  prepare:
+    name: Prepare Batches
+    runs-on: ubuntu-latest
+    outputs:
+      batches: ${{ steps.create-batches.outputs.batches }}
+      total_batches: ${{ steps.create-batches.outputs.total_batches }}
+      use_azure: ${{ steps.create-batches.outputs.use_azure }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Create batch assignments
+        id: create-batches
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          import math
+
+          # Configuration
+          total_products = int("${{ github.event.inputs.total_products }}")
+          batch_size = int("${{ github.event.inputs.batch_size }}")
+          use_azure = "${{ github.event.inputs.use_azure }}" == "true"
+          github_workers = int("${{ github.event.inputs.github_workers }}")
+
+          total_batches = math.ceil(total_products / batch_size)
+
+          print(f"Total products: {total_products:,}")
+          print(f"Batch size: {batch_size}")
+          print(f"Total batches: {total_batches:,}")
+          print(f"Use Azure Functions: {use_azure}")
+          print(f"GitHub workers: {github_workers}")
+
+          if use_azure:
+              # Azure Functions can handle most batches
+              # GitHub Actions handles orchestration + some batches
+              azure_batches = total_batches - github_workers
+              github_batches = github_workers
+
+              print(f"Azure Functions: {azure_batches:,} batches")
+              print(f"GitHub Actions: {github_batches} batches")
+
+              # Create list of batch IDs for GitHub Actions (first N batches)
+              batches = list(range(github_batches))
+          else:
+              # Pure GitHub Actions (max 256)
+              batches = list(range(min(total_batches, 256)))
+
+          # Output for matrix
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"batches={json.dumps(batches)}\n")
+              f.write(f"total_batches={total_batches}\n")
+              f.write(f"use_azure={str(use_azure).lower()}\n")
+
+          print(f"\nGitHub Actions will process {len(batches)} batches")
+          EOF
+
+  # GitHub Actions workers (parallel scraping)
+  scrape-github:
+    name: Scrape Batch ${{ matrix.batch_id }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        batch_id: ${{ fromJson(needs.prepare.outputs.batches) }}
+      fail-fast: false
+      max-parallel: 50
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure proxy
+        env:
+          PROXY_HOST: ${{ secrets.PROXY_HOST }}
+          PROXY_PORT: ${{ secrets.PROXY_PORT }}
+          PROXY_USER: ${{ secrets.PROXY_USER }}
+          PROXY_PASS: ${{ secrets.PROXY_PASS }}
+        run: |
+          cat > .env << EOF
+          PROXY_HOST=${PROXY_HOST}
+          PROXY_PORT=${PROXY_PORT}
+          PROXY_USER=${PROXY_USER}
+          PROXY_PASS=${PROXY_PASS}
+          BATCH_ID=${{ matrix.batch_id }}
+          BATCH_SIZE=${{ github.event.inputs.batch_size }}
+          WORKERS=3
+          EOF
+
+      - name: Scrape batch
+        id: scrape
+        run: |
+          python3 serverless/batch_scraper.py \
+            --batch-id ${{ matrix.batch_id }} \
+            --batch-size ${{ github.event.inputs.batch_size }} \
+            --output-dir ./output \
+            --workers 3
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: github-batch-${{ matrix.batch_id }}
+          path: output/batch_${{ matrix.batch_id }}_*.json
+          retention-days: 7
+
+  # Azure Functions orchestration (sends batches to Azure)
+  orchestrate-azure:
+    name: Orchestrate Azure Functions
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.use_azure == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Send batches to Azure Functions
+        env:
+          AZURE_FUNCTION_URL: ${{ secrets.AZURE_FUNCTION_URL }}
+          AZURE_FUNCTION_KEY: ${{ secrets.AZURE_FUNCTION_KEY }}
+        run: |
+          python3 << 'EOF'
+          import requests
+          import json
+          import time
+          import os
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          # Configuration
+          total_batches = int("${{ needs.prepare.outputs.total_batches }}")
+          github_workers = int("${{ github.event.inputs.github_workers }}")
+          batch_size = int("${{ github.event.inputs.batch_size }}")
+
+          # Azure handles remaining batches
+          azure_start_batch = github_workers
+          azure_batches = total_batches - github_workers
+
+          print(f"Sending {azure_batches:,} batches to Azure Functions")
+          print(f"Starting from batch {azure_start_batch}")
+
+          function_url = os.environ['AZURE_FUNCTION_URL']
+          function_key = os.environ['AZURE_FUNCTION_KEY']
+
+          if not function_url:
+              print("⚠️  AZURE_FUNCTION_URL not set, skipping Azure deployment")
+              exit(0)
+
+          def send_batch(batch_id):
+              """Send a batch to Azure Functions"""
+              # Generate URLs for this batch
+              start_idx = batch_id * batch_size
+              urls = [
+                  f"https://www.mrosupply.com/product/{i:07d}"
+                  for i in range(start_idx, start_idx + batch_size)
+              ]
+
+              # Send to Azure Function
+              try:
+                  response = requests.post(
+                      f"{function_url}/api/scrape",
+                      params={'code': function_key} if function_key else {},
+                      json={
+                          'urls': urls,
+                          'batch_id': batch_id
+                      },
+                      timeout=300
+                  )
+
+                  if response.status_code == 200:
+                      result = response.json()
+                      print(f"✓ Batch {batch_id}: {result['success']}/{result['total']} success")
+                      return True, result
+                  else:
+                      print(f"✗ Batch {batch_id}: HTTP {response.status_code}")
+                      return False, None
+
+              except Exception as e:
+                  print(f"✗ Batch {batch_id}: Error - {e}")
+                  return False, None
+
+          # Send batches in parallel
+          max_concurrent = 20  # Azure Functions auto-scales
+          success_count = 0
+          failed_count = 0
+
+          with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+              futures = {
+                  executor.submit(send_batch, batch_id): batch_id
+                  for batch_id in range(azure_start_batch, total_batches)
+              }
+
+              for future in as_completed(futures):
+                  success, result = future.result()
+                  if success:
+                      success_count += 1
+                  else:
+                      failed_count += 1
+
+                  # Progress
+                  total = success_count + failed_count
+                  if total % 50 == 0:
+                      print(f"Progress: {total}/{azure_batches} batches "
+                            f"({success_count} success, {failed_count} failed)")
+
+          print(f"\n✅ Azure Functions completed:")
+          print(f"   Success: {success_count:,} batches")
+          print(f"   Failed: {failed_count:,} batches")
+          print(f"   Total: {azure_batches:,} batches")
+
+          # Save summary
+          with open('azure_summary.json', 'w') as f:
+              json.dump({
+                  'success_count': success_count,
+                  'failed_count': failed_count,
+                  'total_batches': azure_batches
+              }, f)
+          EOF
+
+      - name: Upload Azure summary
+        uses: actions/upload-artifact@v3
+        with:
+          name: azure-summary
+          path: azure_summary.json
+          retention-days: 7
+
+  # Aggregate all results
+  aggregate:
+    name: Aggregate Results
+    needs: [prepare, scrape-github, orchestrate-azure]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download GitHub artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ./artifacts
+
+      - name: Download Azure summary
+        uses: actions/download-artifact@v3
+        with:
+          name: azure-summary
+          path: ./azure-summary
+        continue-on-error: true
+
+      - name: Aggregate results
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          from pathlib import Path
+
+          print("Aggregating results...")
+
+          # Collect GitHub results
+          github_products = []
+          github_errors = []
+
+          artifacts_dir = Path('./artifacts')
+          for batch_dir in artifacts_dir.glob('github-batch-*'):
+              for json_file in batch_dir.glob('batch_*_products.json'):
+                  try:
+                      with open(json_file) as f:
+                          products = json.load(f)
+                          github_products.extend(products)
+                  except Exception as e:
+                      print(f"Error reading {json_file}: {e}")
+
+              for json_file in batch_dir.glob('batch_*_failed.json'):
+                  try:
+                      with open(json_file) as f:
+                          errors = json.load(f)
+                          github_errors.extend(errors)
+                  except:
+                      pass
+
+          # Load Azure summary
+          azure_success = 0
+          azure_failed = 0
+
+          try:
+              with open('./azure-summary/azure_summary.json') as f:
+                  azure_data = json.load(f)
+                  azure_success = azure_data['success_count']
+                  azure_failed = azure_data['failed_count']
+          except:
+              print("No Azure summary found")
+
+          # Calculate totals
+          total_products = len(github_products)
+          total_errors = len(github_errors)
+
+          print(f"\n{'='*60}")
+          print(f"FINAL RESULTS")
+          print(f"{'='*60}")
+          print(f"GitHub Actions:")
+          print(f"  Products: {total_products:,}")
+          print(f"  Errors: {total_errors:,}")
+          print(f"\nAzure Functions:")
+          print(f"  Success batches: {azure_success:,}")
+          print(f"  Failed batches: {azure_failed:,}")
+          print(f"{'='*60}")
+
+          # Save final summary
+          summary = {
+              'github_products': total_products,
+              'github_errors': total_errors,
+              'azure_success_batches': azure_success,
+              'azure_failed_batches': azure_failed,
+              'total_batches': azure_success + azure_failed + (total_products // 100)
+          }
+
+          with open('final_summary.json', 'w') as f:
+              json.dump(summary, f, indent=2)
+
+          # Create report
+          with open('SCRAPING_REPORT.md', 'w') as f:
+              f.write(f"# Scraping Completed\n\n")
+              f.write(f"## Results\n\n")
+              f.write(f"### GitHub Actions\n")
+              f.write(f"- Products scraped: {total_products:,}\n")
+              f.write(f"- Errors: {total_errors:,}\n\n")
+              f.write(f"### Azure Functions\n")
+              f.write(f"- Success batches: {azure_success:,}\n")
+              f.write(f"- Failed batches: {azure_failed:,}\n\n")
+              f.write(f"### Total\n")
+              f.write(f"- Estimated products: {azure_success * 100 + total_products:,}\n")
+
+          print("\n✅ Aggregation complete")
+          EOF
+
+      - name: Upload final results
+        uses: actions/upload-artifact@v3
+        with:
+          name: final-results
+          path: |
+            final_summary.json
+            SCRAPING_REPORT.md
+          retention-days: 30
+
+  # Send notification
+  notify:
+    name: Send Notification
+    needs: [prepare, scrape-github, orchestrate-azure, aggregate]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download summary
+        uses: actions/download-artifact@v3
+        with:
+          name: final-results
+          path: ./results
+        continue-on-error: true
+
+      - name: Send email notification
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          NOTIFICATION_EMAIL: ${{ secrets.NOTIFICATION_EMAIL }}
+        run: |
+          python3 << 'EOF'
+          import smtplib
+          import os
+          import json
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+
+          # Load summary
+          try:
+              with open('./results/final_summary.json') as f:
+                  summary = json.load(f)
+          except:
+              summary = {'github_products': 0, 'azure_success_batches': 0}
+
+          # Create email
+          msg = MIMEMultipart()
+          msg['From'] = os.environ['SMTP_USER']
+          msg['To'] = os.environ['NOTIFICATION_EMAIL']
+          msg['Subject'] = '✅ Distributed Scraping Completed'
+
+          body = f"""
+          Distributed Scraping Job Completed
+
+          GitHub Actions: {summary.get('github_products', 0):,} products
+          Azure Functions: {summary.get('azure_success_batches', 0):,} batches
+
+          Total estimated: {summary.get('azure_success_batches', 0) * 100 + summary.get('github_products', 0):,} products
+
+          Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Download artifacts to get full results.
+          """
+
+          msg.attach(MIMEText(body, 'plain'))
+
+          # Send email
+          try:
+              with smtplib.SMTP(os.environ['SMTP_HOST'], int(os.environ['SMTP_PORT'])) as server:
+                  server.starttls()
+                  server.login(os.environ['SMTP_USER'], os.environ['SMTP_PASS'])
+                  server.send_message(msg)
+              print("✅ Notification sent")
+          except Exception as e:
+              print(f"⚠️  Failed to send email: {e}")
+          EOF
